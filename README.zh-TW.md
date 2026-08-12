@@ -41,7 +41,7 @@
 ### 1. 下載專案 (Clone)
 
 ```powershell
-git clone https://github.com/your-username/HotspotManager.git E:\git\HotspotManager
+git clone https://github.com/chienhaoc/HotspotManager.git E:\git\HotspotManager
 cd E:\git\HotspotManager
 ```
 

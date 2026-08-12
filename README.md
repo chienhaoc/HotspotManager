@@ -41,7 +41,7 @@ Built using pure **PowerShell 5.1 + WinForms + Windows WinRT API** — **100% na
 ### 1. Clone the repository
 
 ```powershell
-git clone https://github.com/your-username/HotspotManager.git E:\git\HotspotManager
+git clone https://github.com/chienhaoc/HotspotManager.git E:\git\HotspotManager
 cd E:\git\HotspotManager
 ```
 
