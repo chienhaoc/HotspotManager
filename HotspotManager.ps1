@@ -37,10 +37,14 @@ function Await-WinRT ($WinRtTask, $ResultType) {
 [Windows.Networking.NetworkOperators.TetheringOperationalState, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime] | Out-Null
 
 # ---------------------------------------------------------------------------
-# API
+# API & State
 # ---------------------------------------------------------------------------
-$script:clientFirstSeen = @{}
-$script:hotspotStartTime = $null
+$script:clientFirstSeen       = @{}
+$script:hotspotStartTime      = $null
+$script:autoResumeWanted      = $true   # True: user wants hotspot running whenever WAN is available
+$script:wasRunningBeforeSleep = $false  # True: hotspot was active right before sleep
+$script:isSleeping            = $false  # True: currently suspended/sleeping
+$script:lastWanProfile        = $null
 
 function Format-Bytes ([long]$bytes) {
     if ($bytes -ge 1GB) { return "{0:N2} GB" -f ($bytes / 1GB) }
@@ -53,7 +57,8 @@ function Get-HotspotStatus {
     try {
         $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
         if ($null -eq $profile) {
-            return @{ State='Off'; Ssid=''; Pass=''; Source='No internet connection'; Clients=@(); Traffic='-' }
+            $srcDesc = if ($script:autoResumeWanted) { 'Disconnected (Auto-start on WAN UP)' } else { 'No internet connection' }
+            return @{ State='Off'; Ssid=''; Pass=''; Source=$srcDesc; Clients=@(); Traffic='-' }
         }
         $mgr  = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
         $cfg  = $mgr.GetCurrentAccessPointConfiguration()
@@ -150,9 +155,10 @@ function New-TrayIcon ([string]$State) {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear([System.Drawing.Color]::Transparent)
     $color = switch ($State) {
-        'On'   { [System.Drawing.Color]::FromArgb(34,197,94)  }
-        'Busy' { [System.Drawing.Color]::FromArgb(251,191,36) }
-        default{ [System.Drawing.Color]::FromArgb(107,114,128)}
+        'On'      { [System.Drawing.Color]::FromArgb(34,197,94)  }
+        'Busy'    { [System.Drawing.Color]::FromArgb(251,191,36) }
+        'Waiting' { [System.Drawing.Color]::FromArgb(251,191,36) }
+        default   { [System.Drawing.Color]::FromArgb(107,114,128)}
     }
     $pen = New-Object System.Drawing.Pen $color, 2.5
     $cx=16; $cy=20
@@ -206,8 +212,6 @@ $form.AutoScaleDimensions = New-Object System.Drawing.SizeF 96.0, 96.0
 
 # ---------------------------------------------------------------------------
 # Outer TableLayoutPanel
-# Key rule: AutoSize rows must NOT contain Dock=Fill children.
-#           Use Absolute rows for fixed-size sections; DPI scaling handles them.
 # ---------------------------------------------------------------------------
 $outer = New-Object System.Windows.Forms.TableLayoutPanel
 $outer.Dock        = [System.Windows.Forms.DockStyle]::Fill
@@ -215,7 +219,6 @@ $outer.BackColor   = $C.BG
 $outer.ColumnCount = 1
 $outer.Padding     = New-Object System.Windows.Forms.Padding 14,10,14,10
 
-# Row heights at 96dpi (AutoScaleMode=Dpi will multiply by DPI factor)
 $RS = [System.Windows.Forms.RowStyle]
 $ST = [System.Windows.Forms.SizeType]
 $outer.RowCount = 8
@@ -229,7 +232,6 @@ $outer.RowStyles.Add((New-Object $RS $ST::Absolute, 20)) | Out-Null  # 6 "CONNEC
 $outer.RowStyles.Add((New-Object $RS $ST::Percent, 100)) | Out-Null  # 7 listview
 $form.Controls.Add($outer)
 
-# ── Helper: add a control at column 0 of given row ──────────────────────────
 function Add-To ($ctrl, $row, [int]$marginT=0, [int]$marginB=0) {
     $ctrl.Margin = New-Object System.Windows.Forms.Padding 0,$marginT,0,$marginB
     $outer.Controls.Add($ctrl, 0, $row)
@@ -265,13 +267,11 @@ $sep1.Dock = [System.Windows.Forms.DockStyle]::Fill; $sep1.BackColor = $C.Sep
 Add-To $sep1 1
 
 # ── Row 2: Status Card ───────────────────────────────────────────────────────
-# Panel (fixed-height row) → Dock=Fill children work fine
 $card           = New-Object System.Windows.Forms.Panel
 $card.Dock      = [System.Windows.Forms.DockStyle]::Fill
 $card.BackColor = $C.Card
 $card.Padding   = New-Object System.Windows.Forms.Padding 10,8,10,6
 
-# State row (Dock=Top) — added to card LAST so it stacks on top
 $pState             = New-Object System.Windows.Forms.FlowLayoutPanel
 $pState.Dock        = [System.Windows.Forms.DockStyle]::Top
 $pState.BackColor   = $C.Tr
@@ -306,7 +306,6 @@ $lblClients.Margin    = New-Object System.Windows.Forms.Padding 6,4,0,0
 
 $pState.Controls.AddRange(@($lblDot, $lblState, $lblClients))
 
-# Info grid (Dock=Fill) — added to card FIRST so pState docks on top of it
 $infoGrid             = New-Object System.Windows.Forms.TableLayoutPanel
 $infoGrid.Dock        = [System.Windows.Forms.DockStyle]::Fill
 $infoGrid.BackColor   = $C.Tr
@@ -343,10 +342,8 @@ $lblSrcVal  = Add-InfoRow2 'Source:'   0
 $lblSsidVal = Add-InfoRow2 'SSID:'     1
 $lblPassVal = Add-InfoRow2 'Password:' 2
 
-# Add infoGrid first (Fill), then pState (Top) — docking order matters
 $card.Controls.Add($infoGrid)
 $card.Controls.Add($pState)
-
 Add-To $card 2 4 4
 
 # ── Row 3: Toggle button ──────────────────────────────────────────────────────
@@ -458,9 +455,14 @@ function Update-Tray {
     $s     = $script:lastStatus
     $state = $s.State
     $cnt   = $s.Clients.Count
-    $script:notifyIcon.Icon = New-TrayIcon $state
+    
+    $trayIconState = if ($state -eq 'On') { 'On' } elseif ($script:autoResumeWanted -and $null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()) { 'Waiting' } else { 'Off' }
+    $script:notifyIcon.Icon = New-TrayIcon $trayIconState
+
     $devStr = if ($cnt -gt 0) { " ($cnt connected)" } else { '' }
-    $script:notifyIcon.Text = "Hotspot: $state$devStr"
+    $statusText = if ($state -eq 'On') { "Hotspot: On$devStr" } elseif ($trayIconState -eq 'Waiting') { "Hotspot: Waiting for WAN..." } else { "Hotspot: Off" }
+    $script:notifyIcon.Text = $statusText
+
     if ($null -ne $script:miStart) {
         $script:miStart.Enabled = ($state -ne 'On')
         $script:miStop.Enabled  = ($state -eq 'On')
@@ -473,11 +475,19 @@ function Update-Tray {
 function Update-FormUI {
     $s = $script:lastStatus
     $state = $s.State
+    $isWaitingWan = ($state -ne 'On' -and $script:autoResumeWanted -and ($null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()))
+
     if ($state -eq 'On') {
         $lblDot.ForeColor    = $C.Green
         $lblState.Text       = 'On'
         $lblState.ForeColor  = $C.Green
         $btnToggle.Text      = 'Stop Hotspot'
+        $btnToggle.BackColor = $C.RedBtn
+    } elseif ($isWaitingWan) {
+        $lblDot.ForeColor    = $C.Yellow
+        $lblState.Text       = 'Off (Waiting for WAN)'
+        $lblState.ForeColor  = $C.Yellow
+        $btnToggle.Text      = 'Stop Auto-Resume'
         $btnToggle.BackColor = $C.RedBtn
     } else {
         $lblDot.ForeColor    = $C.Red
@@ -486,6 +496,7 @@ function Update-FormUI {
         $btnToggle.Text      = 'Start Hotspot'
         $btnToggle.BackColor = $C.Green
     }
+
     $cnt = $s.Clients.Count
     $lblClients.Text  = "   $cnt device$(if($cnt -ne 1){'s'}) connected"
     $lblSrcVal.Text   = if ($s.Source) { $s.Source } else { '-' }
@@ -521,19 +532,38 @@ function Update-FormUI {
 }
 
 # ---------------------------------------------------------------------------
-# Full refresh
+# Full refresh & WAN Auto-Recovery
 # ---------------------------------------------------------------------------
 function Do-Refresh {
+    if ($script:isSleeping) { return }
+
+    $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+    $isWanUp = ($null -ne $profile)
+
+    # If WAN is UP and auto-resume is wanted, check if hotspot needs auto-starting
+    if ($isWanUp -and $script:autoResumeWanted -and -not $script:isBusy) {
+        $curState = Get-HotspotStatus
+        if ($curState.State -ne 'On' -and $curState.State -ne 'InTransition') {
+            # Auto-start hotspot on WAN UP
+            $script:lastWanProfile = $profile.ProfileName
+            Do-HotspotAction 'Start' $true  # silent auto-start
+            return
+        }
+        $script:lastWanProfile = $profile.ProfileName
+    } elseif (-not $isWanUp) {
+        $script:lastWanProfile = $null
+    }
+
     $script:lastStatus = Get-HotspotStatus
     Update-Tray
     if ($form.Visible) { Update-FormUI }
 }
 
 # ---------------------------------------------------------------------------
-# Hotspot toggle action
+# Hotspot action
 # ---------------------------------------------------------------------------
-function Do-HotspotAction ([string]$Action) {
-    if ($script:isBusy) { return }
+function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
+    if ($script:isBusy -or $script:isSleeping) { return }
     $script:isBusy     = $true
     $btnToggle.Enabled = $false
     $busy = if ($Action -eq 'Start') { 'Starting...' } else { 'Stopping...' }
@@ -546,11 +576,21 @@ function Do-HotspotAction ([string]$Action) {
     [System.Windows.Forms.Application]::DoEvents()
     
     $err = Invoke-HotspotAction $Action
-    if ($null -ne $err) {
+    if ($null -ne $err -and -not $IsAuto) {
         [System.Windows.Forms.MessageBox]::Show($err, 'Hotspot Manager Error', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     }
+
+    # Update user desired state
+    if ($Action -eq 'Start') {
+        $script:autoResumeWanted = $true
+    } elseif ($Action -eq 'Stop' -and -not $IsAuto) {
+        $script:autoResumeWanted = $false
+    }
     
-    Do-Refresh
+    $script:lastStatus = Get-HotspotStatus
+    Update-Tray
+    if ($form.Visible) { Update-FormUI }
+
     $btnToggle.Enabled = $true
     $script:isBusy     = $false
 }
@@ -561,8 +601,19 @@ function Do-HotspotAction ([string]$Action) {
 $btnToggle.Add_Click({
     if ($script:isBusy) { return }
     $curState = (Get-HotspotStatus).State
-    $action   = if ($curState -eq 'On') { 'Stop' } else { 'Start' }
-    Do-HotspotAction $action
+    if ($curState -eq 'On') {
+        $script:autoResumeWanted = $false
+        Do-HotspotAction 'Stop'
+    } elseif ($script:autoResumeWanted -and ($null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile())) {
+        # User clicked Stop Auto-Resume while waiting for WAN
+        $script:autoResumeWanted = $false
+        $script:lastStatus = Get-HotspotStatus
+        Update-Tray
+        if ($form.Visible) { Update-FormUI }
+    } else {
+        $script:autoResumeWanted = $true
+        Do-HotspotAction 'Start'
+    }
 })
 $btnRefresh.Add_Click({ Do-Refresh })
 
@@ -577,10 +628,39 @@ $listView.Add_ColumnWidthChanged({ Save-Config })
 $form.Add_VisibleChanged({ if ($form.Visible) { Update-FormUI } })
 
 # ---------------------------------------------------------------------------
-# Auto-refresh timer (10s)
+# Power Management (Sleep / Suspend Detection)
+# ---------------------------------------------------------------------------
+$script:powerHandler = [Microsoft.Win32.PowerModeChangedEventHandler]{
+    param($sender, $e)
+    try {
+        if ($e.Mode -eq [Microsoft.Win32.PowerModes]::Suspend) {
+            # System is going to sleep: stop hotspot immediately to allow sleep
+            $script:isSleeping = $true
+            $cur = Get-HotspotStatus
+            if ($cur.State -eq 'On') {
+                $script:wasRunningBeforeSleep = $true
+                Invoke-HotspotAction 'Stop'
+            } else {
+                $script:wasRunningBeforeSleep = $false
+            }
+        } elseif ($e.Mode -eq [Microsoft.Win32.PowerModes]::Resume) {
+            # System waking up: restore auto-resume flag
+            $script:isSleeping = $false
+            if ($script:wasRunningBeforeSleep) {
+                $script:autoResumeWanted = $true
+                $script:wasRunningBeforeSleep = $false
+            }
+            Do-Refresh
+        }
+    } catch {}
+}
+[Microsoft.Win32.SystemEvents]::add_PowerModeChanged($script:powerHandler)
+
+# ---------------------------------------------------------------------------
+# Auto-refresh timer (4s)
 # ---------------------------------------------------------------------------
 $timer          = New-Object System.Windows.Forms.Timer
-$timer.Interval = 10000
+$timer.Interval = 4000
 $timer.Add_Tick({ if (-not $script:isBusy) { Do-Refresh } })
 $timer.Start()
 
@@ -606,9 +686,12 @@ function Show-Form {
 }
 
 $miOpen.Add_Click({         Show-Form })
-$script:miStart.Add_Click({ Do-HotspotAction 'Start' })
-$script:miStop.Add_Click({  Do-HotspotAction 'Stop'  })
+$script:miStart.Add_Click({ $script:autoResumeWanted = $true;  Do-HotspotAction 'Start' })
+$script:miStop.Add_Click({  $script:autoResumeWanted = $false; Do-HotspotAction 'Stop'  })
 $miExit.Add_Click({
+    if ($null -ne $script:powerHandler) {
+        [Microsoft.Win32.SystemEvents]::remove_PowerModeChanged($script:powerHandler)
+    }
     Save-Config
     $timer.Stop()
     $script:notifyIcon.Visible=$false; $script:notifyIcon.Dispose()

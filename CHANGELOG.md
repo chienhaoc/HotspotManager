@@ -2,6 +2,14 @@
 
 All notable changes to the HotspotManager project will be documented in this file.
 
+## [1.1.0] - 2026-08-18
+
+### Added
+- **WAN Auto-Recovery**: Automatically restarts Mobile Hotspot sharing as soon as WAN connectivity (e.g. iPhone USB network) comes back online.
+- **Sleep & Suspend Power Management**: Registers `SystemEvents.PowerModeChanged` to immediately stop hotspot sharing when the PC enters Sleep/Suspend, preventing network adapter power request locks and allowing Windows to sleep cleanly.
+- **Auto-Resume on Wake**: Automatically resumes hotspot sharing after the computer wakes from sleep.
+- Faster 4s refresh cycle for prompt WAN recovery detection.
+
 ## [1.0.0] - 2026-08-12
 
 ### Added

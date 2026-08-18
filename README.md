@@ -20,6 +20,12 @@ Built using pure **PowerShell 5.1 + WinForms + Windows WinRT API** — **100% na
 - 📱 **Connected Devices Tracking**:
   - Displays connected device details: Hostname, IP Address, MAC Address
   - ⏱️ **Connection Duration**: Tracks how long each device has been connected
+- 🔄 **WAN Auto-Recovery**:
+  - Automatically turns hotspot back on as soon as WAN connectivity (e.g. iPhone USB tethering) is restored (WAN UP)
+  - Shows clear waiting state when WAN is disconnected
+- 💤 **Smart Sleep & Power Management**:
+  - Detects Windows Sleep / Suspend events (`SystemEvents.PowerModeChanged`) and automatically stops hotspot sharing so your PC can enter sleep mode without driver blocking
+  - Automatically resumes hotspot when the system wakes up
 - 💾 **Persistent Settings**:
   - Automatically saves and restores your preferred window dimensions and column widths
 - 🚀 **Silent Launcher**:
