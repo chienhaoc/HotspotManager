@@ -5,7 +5,7 @@ echo [HotspotManager] Requesting Administrator privileges to remove power overri
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo Elevating to Administrator...
-    powershell -Command "Start-Process cmd -ArgumentList '/c \"\"%~f0\"\"' -Verb RunAs"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd -ArgumentList '/c \"\"%~f0\"\"' -Verb RunAs"
     exit /b
 )
 
