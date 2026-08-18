@@ -6,6 +6,48 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ---------------------------------------------------------------------------
+# Power Broadcast Message Filter (C# IMessageFilter on UI thread)
+# ---------------------------------------------------------------------------
+$powerFilterCode = @"
+using System;
+using System.Windows.Forms;
+
+public class PowerMessageFilter : IMessageFilter
+{
+    public const int WM_POWERBROADCAST = 0x0218;
+    public const int PBT_APMQUERYSUSPEND = 0x0000;
+    public const int PBT_APMSUSPEND = 0x0004;
+    public const int PBT_APMRESUMESUSPEND = 0x0007;
+    public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+
+    public event Action OnSuspend;
+    public event Action OnResume;
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (m.Msg == WM_POWERBROADCAST)
+        {
+            int wParam = m.WParam.ToInt32();
+            if (wParam == PBT_APMSUSPEND || wParam == PBT_APMQUERYSUSPEND)
+            {
+                if (OnSuspend != null) {
+                    try { OnSuspend.Invoke(); } catch {}
+                }
+            }
+            else if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND)
+            {
+                if (OnResume != null) {
+                    try { OnResume.Invoke(); } catch {}
+                }
+            }
+        }
+        return false;
+    }
+}
+"@
+Add-Type -TypeDefinition $powerFilterCode -ReferencedAssemblies System.Windows.Forms, System.Drawing
+
+# ---------------------------------------------------------------------------
 # WinRT bootstrap
 # ---------------------------------------------------------------------------
 $script:asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
@@ -628,29 +670,48 @@ $listView.Add_ColumnWidthChanged({ Save-Config })
 $form.Add_VisibleChanged({ if ($form.Visible) { Update-FormUI } })
 
 # ---------------------------------------------------------------------------
-# Power Management (Sleep / Suspend Detection)
+# Power Management & Suspend Filter
 # ---------------------------------------------------------------------------
+$powerFilter = New-Object PowerMessageFilter
+
+$onSuspendAction = [Action]{
+    try {
+        $script:isSleeping = $true
+        $cur = Get-HotspotStatus
+        if ($cur.State -eq 'On' -or $cur.State -eq 'InTransition') {
+            $script:wasRunningBeforeSleep = $true
+            # Stop tethering synchronously on UI thread so sleep is never blocked
+            Invoke-HotspotAction 'Stop'
+            [System.Windows.Forms.Application]::DoEvents()
+        } else {
+            $script:wasRunningBeforeSleep = $false
+        }
+    } catch {}
+}
+
+$onResumeAction = [Action]{
+    try {
+        $script:isSleeping = $false
+        if ($script:wasRunningBeforeSleep) {
+            $script:autoResumeWanted = $true
+            $script:wasRunningBeforeSleep = $false
+        }
+        Do-Refresh
+    } catch {}
+}
+
+$powerFilter.add_OnSuspend($onSuspendAction)
+$powerFilter.add_OnResume($onResumeAction)
+[System.Windows.Forms.Application]::AddMessageFilter($powerFilter)
+
+# Also keep SystemEvents.PowerModeChanged as backup
 $script:powerHandler = [Microsoft.Win32.PowerModeChangedEventHandler]{
     param($sender, $e)
     try {
         if ($e.Mode -eq [Microsoft.Win32.PowerModes]::Suspend) {
-            # System is going to sleep: stop hotspot immediately to allow sleep
-            $script:isSleeping = $true
-            $cur = Get-HotspotStatus
-            if ($cur.State -eq 'On') {
-                $script:wasRunningBeforeSleep = $true
-                Invoke-HotspotAction 'Stop'
-            } else {
-                $script:wasRunningBeforeSleep = $false
-            }
+            $onSuspendAction.Invoke()
         } elseif ($e.Mode -eq [Microsoft.Win32.PowerModes]::Resume) {
-            # System waking up: restore auto-resume flag
-            $script:isSleeping = $false
-            if ($script:wasRunningBeforeSleep) {
-                $script:autoResumeWanted = $true
-                $script:wasRunningBeforeSleep = $false
-            }
-            Do-Refresh
+            $onResumeAction.Invoke()
         }
     } catch {}
 }
@@ -689,6 +750,9 @@ $miOpen.Add_Click({         Show-Form })
 $script:miStart.Add_Click({ $script:autoResumeWanted = $true;  Do-HotspotAction 'Start' })
 $script:miStop.Add_Click({  $script:autoResumeWanted = $false; Do-HotspotAction 'Stop'  })
 $miExit.Add_Click({
+    if ($null -ne $powerFilter) {
+        [System.Windows.Forms.Application]::RemoveMessageFilter($powerFilter)
+    }
     if ($null -ne $script:powerHandler) {
         [Microsoft.Win32.SystemEvents]::remove_PowerModeChanged($script:powerHandler)
     }
