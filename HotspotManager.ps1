@@ -6,24 +6,46 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ---------------------------------------------------------------------------
-# Power Broadcast Message Filter (C# IMessageFilter on UI thread)
+# Native Power Broadcast Notification Window
+# Uses RegisterSuspendResumeNotification to receive system sleep/suspend broadcasts
 # ---------------------------------------------------------------------------
-$powerFilterCode = @"
+$powerWndCode = @"
 using System;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-public class PowerMessageFilter : IMessageFilter
+public class PowerNotificationWindow : NativeWindow, IDisposable
 {
-    public const int WM_POWERBROADCAST = 0x0218;
-    public const int PBT_APMQUERYSUSPEND = 0x0000;
-    public const int PBT_APMSUSPEND = 0x0004;
-    public const int PBT_APMRESUMESUSPEND = 0x0007;
-    public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    private const int WM_POWERBROADCAST = 0x0218;
+    private const int PBT_APMQUERYSUSPEND = 0x0000;
+    private const int PBT_APMSUSPEND = 0x0004;
+    private const int PBT_APMRESUMESUSPEND = 0x0007;
+    private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
 
-    public event Action OnSuspend;
-    public event Action OnResume;
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr RegisterSuspendResumeNotification(IntPtr hRecipient, uint flags);
 
-    public bool PreFilterMessage(ref Message m)
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnregisterSuspendResumeNotification(IntPtr handle);
+
+    private IntPtr _hNotify = IntPtr.Zero;
+    public Action OnSuspend;
+    public Action OnResume;
+
+    public PowerNotificationWindow()
+    {
+        CreateParams cp = new CreateParams();
+        cp.Caption = "HotspotManager_PowerMsgWnd";
+        CreateHandle(cp);
+
+        try
+        {
+            _hNotify = RegisterSuspendResumeNotification(this.Handle, 0);
+        }
+        catch { }
+    }
+
+    protected override void WndProc(ref Message m)
     {
         if (m.Msg == WM_POWERBROADCAST)
         {
@@ -41,11 +63,21 @@ public class PowerMessageFilter : IMessageFilter
                 }
             }
         }
-        return false;
+        base.WndProc(ref m);
+    }
+
+    public void Dispose()
+    {
+        if (_hNotify != IntPtr.Zero)
+        {
+            try { UnregisterSuspendResumeNotification(_hNotify); } catch {}
+            _hNotify = IntPtr.Zero;
+        }
+        DestroyHandle();
     }
 }
 "@
-Add-Type -TypeDefinition $powerFilterCode -ReferencedAssemblies System.Windows.Forms, System.Drawing
+Add-Type -TypeDefinition $powerWndCode -ReferencedAssemblies System.Windows.Forms, System.Drawing
 
 # ---------------------------------------------------------------------------
 # WinRT bootstrap
@@ -251,6 +283,9 @@ $form.ShowInTaskbar   = $false
 $form.Visible         = $false
 $form.AutoScaleMode       = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.AutoScaleDimensions = New-Object System.Drawing.SizeF 96.0, 96.0
+
+# Force HWND creation so Windows can deliver messages immediately
+$null = $form.Handle
 
 # ---------------------------------------------------------------------------
 # Outer TableLayoutPanel
@@ -670,17 +705,17 @@ $listView.Add_ColumnWidthChanged({ Save-Config })
 $form.Add_VisibleChanged({ if ($form.Visible) { Update-FormUI } })
 
 # ---------------------------------------------------------------------------
-# Power Management & Suspend Filter
+# Power Management (Dedicated Native Message Window with RegisterSuspendResumeNotification)
 # ---------------------------------------------------------------------------
-$powerFilter = New-Object PowerMessageFilter
+$powerWnd = New-Object PowerNotificationWindow
 
-$onSuspendAction = [Action]{
+$powerWnd.OnSuspend = [Action]{
     try {
         $script:isSleeping = $true
         $cur = Get-HotspotStatus
         if ($cur.State -eq 'On' -or $cur.State -eq 'InTransition') {
             $script:wasRunningBeforeSleep = $true
-            # Stop tethering synchronously on UI thread so sleep is never blocked
+            # Stop tethering immediately so Windows power transition is never blocked
             Invoke-HotspotAction 'Stop'
             [System.Windows.Forms.Application]::DoEvents()
         } else {
@@ -689,7 +724,7 @@ $onSuspendAction = [Action]{
     } catch {}
 }
 
-$onResumeAction = [Action]{
+$powerWnd.OnResume = [Action]{
     try {
         $script:isSleeping = $false
         if ($script:wasRunningBeforeSleep) {
@@ -699,23 +734,6 @@ $onResumeAction = [Action]{
         Do-Refresh
     } catch {}
 }
-
-$powerFilter.add_OnSuspend($onSuspendAction)
-$powerFilter.add_OnResume($onResumeAction)
-[System.Windows.Forms.Application]::AddMessageFilter($powerFilter)
-
-# Also keep SystemEvents.PowerModeChanged as backup
-$script:powerHandler = [Microsoft.Win32.PowerModeChangedEventHandler]{
-    param($sender, $e)
-    try {
-        if ($e.Mode -eq [Microsoft.Win32.PowerModes]::Suspend) {
-            $onSuspendAction.Invoke()
-        } elseif ($e.Mode -eq [Microsoft.Win32.PowerModes]::Resume) {
-            $onResumeAction.Invoke()
-        }
-    } catch {}
-}
-[Microsoft.Win32.SystemEvents]::add_PowerModeChanged($script:powerHandler)
 
 # ---------------------------------------------------------------------------
 # Auto-refresh timer (4s)
@@ -750,11 +768,8 @@ $miOpen.Add_Click({         Show-Form })
 $script:miStart.Add_Click({ $script:autoResumeWanted = $true;  Do-HotspotAction 'Start' })
 $script:miStop.Add_Click({  $script:autoResumeWanted = $false; Do-HotspotAction 'Stop'  })
 $miExit.Add_Click({
-    if ($null -ne $powerFilter) {
-        [System.Windows.Forms.Application]::RemoveMessageFilter($powerFilter)
-    }
-    if ($null -ne $script:powerHandler) {
-        [Microsoft.Win32.SystemEvents]::remove_PowerModeChanged($script:powerHandler)
+    if ($null -ne $powerWnd) {
+        $powerWnd.Dispose()
     }
     Save-Config
     $timer.Stop()
