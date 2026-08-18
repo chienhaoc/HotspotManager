@@ -6,80 +6,6 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ---------------------------------------------------------------------------
-# Native Power Broadcast Notification Window
-# Uses RegisterSuspendResumeNotification to receive system sleep/suspend broadcasts
-# ---------------------------------------------------------------------------
-$powerWndCode = @"
-using System;
-using System.Runtime.InteropServices;
-using System.Windows.Forms;
-
-public class PowerNotificationWindow : NativeWindow, IDisposable
-{
-    private const int WM_POWERBROADCAST = 0x0218;
-    private const int PBT_APMQUERYSUSPEND = 0x0000;
-    private const int PBT_APMSUSPEND = 0x0004;
-    private const int PBT_APMRESUMESUSPEND = 0x0007;
-    private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr RegisterSuspendResumeNotification(IntPtr hRecipient, uint flags);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UnregisterSuspendResumeNotification(IntPtr handle);
-
-    private IntPtr _hNotify = IntPtr.Zero;
-    public Action OnSuspend;
-    public Action OnResume;
-
-    public PowerNotificationWindow()
-    {
-        CreateParams cp = new CreateParams();
-        cp.Caption = "HotspotManager_PowerMsgWnd";
-        CreateHandle(cp);
-
-        try
-        {
-            _hNotify = RegisterSuspendResumeNotification(this.Handle, 0);
-        }
-        catch { }
-    }
-
-    protected override void WndProc(ref Message m)
-    {
-        if (m.Msg == WM_POWERBROADCAST)
-        {
-            int wParam = m.WParam.ToInt32();
-            if (wParam == PBT_APMSUSPEND || wParam == PBT_APMQUERYSUSPEND)
-            {
-                if (OnSuspend != null) {
-                    try { OnSuspend.Invoke(); } catch {}
-                }
-            }
-            else if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND)
-            {
-                if (OnResume != null) {
-                    try { OnResume.Invoke(); } catch {}
-                }
-            }
-        }
-        base.WndProc(ref m);
-    }
-
-    public void Dispose()
-    {
-        if (_hNotify != IntPtr.Zero)
-        {
-            try { UnregisterSuspendResumeNotification(_hNotify); } catch {}
-            _hNotify = IntPtr.Zero;
-        }
-        DestroyHandle();
-    }
-}
-"@
-Add-Type -TypeDefinition $powerWndCode -ReferencedAssemblies System.Windows.Forms, System.Drawing
-
-# ---------------------------------------------------------------------------
 # WinRT bootstrap
 # ---------------------------------------------------------------------------
 $script:asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
@@ -113,18 +39,40 @@ function Await-WinRT ($WinRtTask, $ResultType) {
 # ---------------------------------------------------------------------------
 # API & State
 # ---------------------------------------------------------------------------
-$script:clientFirstSeen       = @{}
-$script:hotspotStartTime      = $null
-$script:autoResumeWanted      = $true   # True: user wants hotspot running whenever WAN is available
-$script:wasRunningBeforeSleep = $false  # True: hotspot was active right before sleep
-$script:isSleeping            = $false  # True: currently suspended/sleeping
-$script:lastWanProfile        = $null
+$script:clientFirstSeen  = @{}
+$script:hotspotStartTime = $null
+$script:autoResumeWanted = $true   # Auto-start hotspot on WAN UP
+$script:lastWanProfile   = $null
 
 function Format-Bytes ([long]$bytes) {
     if ($bytes -ge 1GB) { return "{0:N2} GB" -f ($bytes / 1GB) }
     if ($bytes -ge 1MB) { return "{0:N2} MB" -f ($bytes / 1MB) }
     if ($bytes -ge 1KB) { return "{0:N2} KB" -f ($bytes / 1KB) }
     return "$bytes B"
+}
+
+# ---------------------------------------------------------------------------
+# Sleep Support Management (powercfg /requestsoverride)
+# ---------------------------------------------------------------------------
+function Test-SleepSupport {
+    try {
+        $out = powercfg /requestsoverride
+        return ($out -match 'SharedAccess')
+    } catch {
+        return $false
+    }
+}
+
+function Set-SleepSupport ([bool]$Enable) {
+    $cmd = if ($Enable) {
+        'powercfg /requestsoverride SERVICE "SharedAccess" System Awaymode; powercfg /requestsoverride SERVICE "icssvc" System Awaymode; powercfg /requestsoverride SERVICE "WlanSvc" System Awaymode; powercfg /requestsoverride DRIVER "Microsoft Wi-Fi Direct Virtual Adapter" System Awaymode; powercfg /requestsoverride DRIVER "Microsoft Wi-Fi Direct Virtual Adapter #2" System Awaymode; powercfg /requestsoverride DRIVER "Legacy Kernel Caller" System Awaymode'
+    } else {
+        'powercfg /requestsoverride SERVICE "SharedAccess"; powercfg /requestsoverride SERVICE "icssvc"; powercfg /requestsoverride SERVICE "WlanSvc"; powercfg /requestsoverride DRIVER "Microsoft Wi-Fi Direct Virtual Adapter"; powercfg /requestsoverride DRIVER "Microsoft Wi-Fi Direct Virtual Adapter #2"; powercfg /requestsoverride DRIVER "Legacy Kernel Caller"'
+    }
+
+    try {
+        Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`"" -Verb RunAs -WindowStyle Hidden -Wait
+    } catch {}
 }
 
 function Get-HotspotStatus {
@@ -273,8 +221,8 @@ $fntMenuBold = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontSty
 # ---------------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = 'Hotspot Manager'
-$form.ClientSize      = New-Object System.Drawing.Size 390, 500
-$form.MinimumSize     = New-Object System.Drawing.Size 320, 420
+$form.ClientSize      = New-Object System.Drawing.Size 390, 520
+$form.MinimumSize     = New-Object System.Drawing.Size 320, 440
 $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
 $form.MaximizeBox     = $false
@@ -283,9 +231,6 @@ $form.ShowInTaskbar   = $false
 $form.Visible         = $false
 $form.AutoScaleMode       = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.AutoScaleDimensions = New-Object System.Drawing.SizeF 96.0, 96.0
-
-# Force HWND creation so Windows can deliver messages immediately
-$null = $form.Handle
 
 # ---------------------------------------------------------------------------
 # Outer TableLayoutPanel
@@ -301,7 +246,7 @@ $ST = [System.Windows.Forms.SizeType]
 $outer.RowCount = 8
 $outer.RowStyles.Add((New-Object $RS $ST::Absolute, 56)) | Out-Null  # 0 title
 $outer.RowStyles.Add((New-Object $RS $ST::Absolute,  1)) | Out-Null  # 1 sep
-$outer.RowStyles.Add((New-Object $RS $ST::Absolute,116)) | Out-Null  # 2 status card
+$outer.RowStyles.Add((New-Object $RS $ST::Absolute,140)) | Out-Null  # 2 status card
 $outer.RowStyles.Add((New-Object $RS $ST::Absolute, 48)) | Out-Null  # 3 toggle btn
 $outer.RowStyles.Add((New-Object $RS $ST::Absolute, 24)) | Out-Null  # 4 refresh btn
 $outer.RowStyles.Add((New-Object $RS $ST::Absolute,  1)) | Out-Null  # 5 sep
@@ -387,11 +332,11 @@ $infoGrid             = New-Object System.Windows.Forms.TableLayoutPanel
 $infoGrid.Dock        = [System.Windows.Forms.DockStyle]::Fill
 $infoGrid.BackColor   = $C.Tr
 $infoGrid.ColumnCount = 2
-$infoGrid.RowCount    = 3
+$infoGrid.RowCount    = 4
 $CS = [System.Windows.Forms.ColumnStyle]
 $infoGrid.ColumnStyles.Add((New-Object $CS $ST::AutoSize))    | Out-Null
 $infoGrid.ColumnStyles.Add((New-Object $CS $ST::Percent, 100))| Out-Null
-for ($i=0;$i -lt 3;$i++) { $infoGrid.RowStyles.Add((New-Object $RS $ST::Percent, 33)) | Out-Null }
+for ($i=0;$i -lt 4;$i++) { $infoGrid.RowStyles.Add((New-Object $RS $ST::Percent, 25)) | Out-Null }
 
 function Add-InfoRow2 ($label, $row) {
     $lKey           = New-Object System.Windows.Forms.Label
@@ -415,9 +360,10 @@ function Add-InfoRow2 ($label, $row) {
     $infoGrid.Controls.Add($lVal, 1, $row)
     return $lVal
 }
-$lblSrcVal  = Add-InfoRow2 'Source:'   0
-$lblSsidVal = Add-InfoRow2 'SSID:'     1
-$lblPassVal = Add-InfoRow2 'Password:' 2
+$lblSrcVal   = Add-InfoRow2 'Source:'        0
+$lblSsidVal  = Add-InfoRow2 'SSID:'          1
+$lblPassVal  = Add-InfoRow2 'Password:'      2
+$lblSleepVal = Add-InfoRow2 'Allow PC Sleep:' 3
 
 $card.Controls.Add($infoGrid)
 $card.Controls.Add($pState)
@@ -544,6 +490,11 @@ function Update-Tray {
         $script:miStart.Enabled = ($state -ne 'On')
         $script:miStop.Enabled  = ($state -eq 'On')
     }
+
+    if ($null -ne $script:miSleep) {
+        $isSleepSupported = Test-SleepSupport
+        $script:miSleep.Checked = $isSleepSupported
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -575,10 +526,14 @@ function Update-FormUI {
     }
 
     $cnt = $s.Clients.Count
-    $lblClients.Text  = "   $cnt device$(if($cnt -ne 1){'s'}) connected"
-    $lblSrcVal.Text   = if ($s.Source) { $s.Source } else { '-' }
-    $lblSsidVal.Text  = if ($s.Ssid)   { $s.Ssid   } else { '-' }
-    $lblPassVal.Text  = if ($s.Pass)   { $s.Pass   } else { '-' }
+    $lblClients.Text   = "   $cnt device$(if($cnt -ne 1){'s'}) connected"
+    $lblSrcVal.Text    = if ($s.Source) { $s.Source } else { '-' }
+    $lblSsidVal.Text   = if ($s.Ssid)   { $s.Ssid   } else { '-' }
+    $lblPassVal.Text   = if ($s.Pass)   { $s.Pass   } else { '-' }
+
+    $isSleepOk = Test-SleepSupport
+    $lblSleepVal.Text      = if ($isSleepOk) { 'Enabled (Sleep allowed)' } else { 'Disabled (Click Tray Menu to enable)' }
+    $lblSleepVal.ForeColor = if ($isSleepOk) { $C.Green } else { $C.Sub }
 
     # Maintain column widths (only default auto-fit if <= 0)
     $w0 = $listView.Columns[0].Width
@@ -612,8 +567,6 @@ function Update-FormUI {
 # Full refresh & WAN Auto-Recovery
 # ---------------------------------------------------------------------------
 function Do-Refresh {
-    if ($script:isSleeping) { return }
-
     $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
     $isWanUp = ($null -ne $profile)
 
@@ -640,7 +593,7 @@ function Do-Refresh {
 # Hotspot action
 # ---------------------------------------------------------------------------
 function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
-    if ($script:isBusy -or $script:isSleeping) { return }
+    if ($script:isBusy) { return }
     $script:isBusy     = $true
     $btnToggle.Enabled = $false
     $busy = if ($Action -eq 'Start') { 'Starting...' } else { 'Stopping...' }
@@ -705,37 +658,6 @@ $listView.Add_ColumnWidthChanged({ Save-Config })
 $form.Add_VisibleChanged({ if ($form.Visible) { Update-FormUI } })
 
 # ---------------------------------------------------------------------------
-# Power Management (Dedicated Native Message Window with RegisterSuspendResumeNotification)
-# ---------------------------------------------------------------------------
-$powerWnd = New-Object PowerNotificationWindow
-
-$powerWnd.OnSuspend = [Action]{
-    try {
-        $script:isSleeping = $true
-        $cur = Get-HotspotStatus
-        if ($cur.State -eq 'On' -or $cur.State -eq 'InTransition') {
-            $script:wasRunningBeforeSleep = $true
-            # Stop tethering immediately so Windows power transition is never blocked
-            Invoke-HotspotAction 'Stop'
-            [System.Windows.Forms.Application]::DoEvents()
-        } else {
-            $script:wasRunningBeforeSleep = $false
-        }
-    } catch {}
-}
-
-$powerWnd.OnResume = [Action]{
-    try {
-        $script:isSleeping = $false
-        if ($script:wasRunningBeforeSleep) {
-            $script:autoResumeWanted = $true
-            $script:wasRunningBeforeSleep = $false
-        }
-        Do-Refresh
-    } catch {}
-}
-
-# ---------------------------------------------------------------------------
 # Auto-refresh timer (4s)
 # ---------------------------------------------------------------------------
 $timer          = New-Object System.Windows.Forms.Timer
@@ -757,6 +679,9 @@ $ctxMenu.Items.Add('-') | Out-Null
 $script:miStart = $ctxMenu.Items.Add('Start Hotspot')
 $script:miStop  = $ctxMenu.Items.Add('Stop Hotspot')
 $ctxMenu.Items.Add('-') | Out-Null
+$script:miSleep = $ctxMenu.Items.Add('Allow PC Sleep')
+$script:miSleep.CheckOnClick = $false
+$ctxMenu.Items.Add('-') | Out-Null
 $miExit         = $ctxMenu.Items.Add('Exit')
 $miOpen.Font    = $fntMenuBold
 
@@ -767,10 +692,16 @@ function Show-Form {
 $miOpen.Add_Click({         Show-Form })
 $script:miStart.Add_Click({ $script:autoResumeWanted = $true;  Do-HotspotAction 'Start' })
 $script:miStop.Add_Click({  $script:autoResumeWanted = $false; Do-HotspotAction 'Stop'  })
+
+# Toggle Sleep Support from Tray Menu
+$script:miSleep.Add_Click({
+    $currentlyEnabled = Test-SleepSupport
+    $targetState = -not $currentlyEnabled
+    Set-SleepSupport $targetState
+    Do-Refresh
+})
+
 $miExit.Add_Click({
-    if ($null -ne $powerWnd) {
-        $powerWnd.Dispose()
-    }
     Save-Config
     $timer.Stop()
     $script:notifyIcon.Visible=$false; $script:notifyIcon.Dispose()

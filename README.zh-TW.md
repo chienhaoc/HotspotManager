@@ -22,9 +22,9 @@
   - ⏱️ **連線時長 (Connected Time)**：自動記錄並計算每台裝置的已連線時間
 - 🔄 **WAN 斷線自動復原 (WAN Auto-Recovery)**：
   - 當外網（如 iPhone USB 網路）中斷時顯示等待狀態；一旦外網重新連線 (WAN UP)，立即**自動重新啟動熱點分享**
-- 💤 **智慧睡眠電源管理 (Sleep Management)**：
-  - 即時偵測 Windows 睡眠/待命信號 (`SystemEvents.PowerModeChanged`)，自動停止熱點分享以利系統順利進入睡眠模式，避免網卡驅動阻止休眠
-  - 系統喚醒時自動重新喚醒熱點分享
+- 💤 **內建睡眠支援切換 (Allow PC Sleep)**：
+  - 直接整合於系統匣右鍵選單（`Allow PC Sleep`）與主面板狀態，可一鍵開啟/關閉 Windows 電源覆寫規則 (`powercfg /requestsoverride`)
+  - 徹底解除 Windows 行動熱點對電腦睡眠的阻擋，讓電腦能順利進入睡眠並於喚醒時無縫恢復熱點連線
 - 💾 **設定持久化記憶**：
   - 自動儲存並還原您調整好的視窗大小與表格欄位寬度
 - 🚀 **靜默啟動**：

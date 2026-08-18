@@ -23,9 +23,9 @@ Built using pure **PowerShell 5.1 + WinForms + Windows WinRT API** — **100% na
 - 🔄 **WAN Auto-Recovery**:
   - Automatically turns hotspot back on as soon as WAN connectivity (e.g. iPhone USB tethering) is restored (WAN UP)
   - Shows clear waiting state when WAN is disconnected
-- 💤 **Smart Sleep & Power Management**:
-  - Detects Windows Sleep / Suspend events (`SystemEvents.PowerModeChanged`) and automatically stops hotspot sharing so your PC can enter sleep mode without driver blocking
-  - Automatically resumes hotspot when the system wakes up
+- 💤 **Integrated Sleep Support (Allow PC Sleep)**:
+  - Built-in one-click toggle in the tray context menu (`Allow PC Sleep`) to configure Windows `powercfg /requestsoverride`
+  - Unblocks Windows from sleeping while Mobile Hotspot is running, allowing the PC to sleep and wake smoothly without driver hangs
 - 💾 **Persistent Settings**:
   - Automatically saves and restores your preferred window dimensions and column widths
 - 🚀 **Silent Launcher**:
