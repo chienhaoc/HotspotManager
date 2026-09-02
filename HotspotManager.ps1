@@ -200,10 +200,16 @@ function New-TrayIcon ([string]$State) {
     
     $hIcon = $bmp.GetHicon()
     $icon = [System.Drawing.Icon]::FromHandle($hIcon)
-    # The managed Icon wrapper does NOT own the unmanaged handle, but we can store the handle 
-    # as a custom property so we know which handle to destroy later, or we can just access $icon.Handle.
     $bmp.Dispose()
     return $icon
+}
+
+# Cache static tray icons so handles are created once and never leak or drop in Explorer
+$script:icons = @{
+    'On'      = New-TrayIcon 'On'
+    'Off'     = New-TrayIcon 'Off'
+    'Busy'    = New-TrayIcon 'Busy'
+    'Waiting' = New-TrayIcon 'Waiting'
 }
 
 # ---------------------------------------------------------------------------
@@ -496,16 +502,16 @@ function Update-Tray {
     
     $trayIconState = if ($state -eq 'On') { 'On' } elseif ($script:autoResumeWanted -and $null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()) { 'Waiting' } else { 'Off' }
     
-    $oldIcon = $script:notifyIcon.Icon
-    $script:notifyIcon.Icon = New-TrayIcon $trayIconState
-    if ($null -ne $oldIcon) {
-        [Win32]::DestroyIcon($oldIcon.Handle) | Out-Null
-        $oldIcon.Dispose()
+    $targetIcon = $script:icons[$trayIconState]
+    if ($script:notifyIcon.Icon -ne $targetIcon) {
+        $script:notifyIcon.Icon = $targetIcon
     }
 
     $devStr = if ($cnt -gt 0) { " ($cnt connected)" } else { '' }
     $statusText = if ($state -eq 'On') { "Hotspot: On$devStr" } elseif ($trayIconState -eq 'Waiting') { "Hotspot: Waiting for WAN..." } else { "Hotspot: Off" }
-    $script:notifyIcon.Text = $statusText
+    if ($script:notifyIcon.Text -ne $statusText) {
+        $script:notifyIcon.Text = $statusText
+    }
 
     if ($null -ne $script:miStart) {
         $script:miStart.Enabled = ($state -ne 'On')
@@ -623,11 +629,9 @@ function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
         $btnToggle.Text = $busy; $btnToggle.BackColor = $C.Yellow
     }
     
-    $oldIcon = $script:notifyIcon.Icon
-    $script:notifyIcon.Icon = New-TrayIcon 'Busy'
-    if ($null -ne $oldIcon) {
-        [Win32]::DestroyIcon($oldIcon.Handle) | Out-Null
-        $oldIcon.Dispose()
+    $targetIcon = $script:icons['Busy']
+    if ($script:notifyIcon.Icon -ne $targetIcon) {
+        $script:notifyIcon.Icon = $targetIcon
     }
     $script:notifyIcon.Text = "Hotspot: $busy"
     [System.Windows.Forms.Application]::DoEvents()
@@ -700,7 +704,7 @@ $timer.Start()
 # NotifyIcon + context menu
 # ---------------------------------------------------------------------------
 $script:notifyIcon        = New-Object System.Windows.Forms.NotifyIcon
-$script:notifyIcon.Icon   = New-TrayIcon 'Off'
+$script:notifyIcon.Icon   = $script:icons['Off']
 $script:notifyIcon.Text   = 'Hotspot Manager'
 $script:notifyIcon.Visible= $true
 
@@ -736,6 +740,13 @@ $miExit.Add_Click({
     Save-Config
     $timer.Stop()
     $script:notifyIcon.Visible=$false; $script:notifyIcon.Dispose()
+    foreach ($k in $script:icons.Keys) {
+        $ic = $script:icons[$k]
+        if ($null -ne $ic) {
+            [Win32]::DestroyIcon($ic.Handle) | Out-Null
+            $ic.Dispose()
+        }
+    }
     [System.Windows.Forms.Application]::Exit()
 })
 $script:notifyIcon.ContextMenuStrip = $ctxMenu
