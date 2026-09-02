@@ -1,7 +1,16 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+}
+"@
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -188,7 +197,13 @@ function New-TrayIcon ([string]$State) {
     $brush = New-Object System.Drawing.SolidBrush $color
     $g.FillEllipse($brush,$cx-2,$cy-2,4,4)
     $pen.Dispose(); $brush.Dispose(); $g.Dispose()
-    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    
+    $hIcon = $bmp.GetHicon()
+    $icon = [System.Drawing.Icon]::FromHandle($hIcon)
+    # The managed Icon wrapper does NOT own the unmanaged handle, but we can store the handle 
+    # as a custom property so we know which handle to destroy later, or we can just access $icon.Handle.
+    $bmp.Dispose()
+    return $icon
 }
 
 # ---------------------------------------------------------------------------
@@ -480,7 +495,13 @@ function Update-Tray {
     $cnt   = $s.Clients.Count
     
     $trayIconState = if ($state -eq 'On') { 'On' } elseif ($script:autoResumeWanted -and $null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()) { 'Waiting' } else { 'Off' }
+    
+    $oldIcon = $script:notifyIcon.Icon
     $script:notifyIcon.Icon = New-TrayIcon $trayIconState
+    if ($null -ne $oldIcon) {
+        [Win32]::DestroyIcon($oldIcon.Handle) | Out-Null
+        $oldIcon.Dispose()
+    }
 
     $devStr = if ($cnt -gt 0) { " ($cnt connected)" } else { '' }
     $statusText = if ($state -eq 'On') { "Hotspot: On$devStr" } elseif ($trayIconState -eq 'Waiting') { "Hotspot: Waiting for WAN..." } else { "Hotspot: Off" }
@@ -601,7 +622,13 @@ function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
         $lblState.Text = $busy; $lblState.ForeColor = $C.Yellow; $lblDot.ForeColor = $C.Yellow
         $btnToggle.Text = $busy; $btnToggle.BackColor = $C.Yellow
     }
+    
+    $oldIcon = $script:notifyIcon.Icon
     $script:notifyIcon.Icon = New-TrayIcon 'Busy'
+    if ($null -ne $oldIcon) {
+        [Win32]::DestroyIcon($oldIcon.Handle) | Out-Null
+        $oldIcon.Dispose()
+    }
     $script:notifyIcon.Text = "Hotspot: $busy"
     [System.Windows.Forms.Application]::DoEvents()
     
@@ -662,7 +689,11 @@ $form.Add_VisibleChanged({ if ($form.Visible) { Update-FormUI } })
 # ---------------------------------------------------------------------------
 $timer          = New-Object System.Windows.Forms.Timer
 $timer.Interval = 4000
-$timer.Add_Tick({ if (-not $script:isBusy) { Do-Refresh } })
+$timer.Add_Tick({ 
+    if (-not $script:isBusy) { 
+        try { Do-Refresh } catch { Write-Host "Timer error: $($_.Exception.Message)" } 
+    } 
+})
 $timer.Start()
 
 # ---------------------------------------------------------------------------
