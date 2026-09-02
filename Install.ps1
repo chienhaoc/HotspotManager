@@ -5,7 +5,7 @@ $targetVbs  = Join-Path $startupDir "HotspotManager.vbs"
 
 $vbsContent = @"
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File ""$scriptRoot\HotspotManager.ps1""", 0, False
+WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""$scriptRoot\HotspotManager.ps1""", 0, False
 "@
 
 Set-Content -Path $targetVbs -Value $vbsContent -Encoding ASCII
