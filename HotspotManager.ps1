@@ -3,15 +3,6 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32 {
-    [DllImport("user32.dll", SetLastError=true)]
-    public static extern bool DestroyIcon(IntPtr hIcon);
-}
-"@
-
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ---------------------------------------------------------------------------
@@ -743,7 +734,6 @@ $miExit.Add_Click({
     foreach ($k in $script:icons.Keys) {
         $ic = $script:icons[$k]
         if ($null -ne $ic) {
-            [Win32]::DestroyIcon($ic.Handle) | Out-Null
             $ic.Dispose()
         }
     }
