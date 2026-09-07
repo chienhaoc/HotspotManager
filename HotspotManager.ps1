@@ -37,12 +37,24 @@ function Await-WinRT ($WinRtTask, $ResultType) {
 [Windows.Networking.NetworkOperators.TetheringOperationalState, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime] | Out-Null
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # API & State
 # ---------------------------------------------------------------------------
-$script:clientFirstSeen  = @{}
-$script:hotspotStartTime = $null
-$script:autoResumeWanted = $true   # Auto-start hotspot on WAN UP
-$script:lastWanProfile   = $null
+$script:clientFirstSeen    = @{}
+$script:hotspotStartTime   = $null
+$script:autoResumeWanted   = $true   # Auto-start hotspot on WAN UP
+$script:lastWanProfile     = $null
+$script:activeWanAdapterId = $null
+$script:tetheringManager   = $null
+
+function Test-WanInternet {
+    try {
+        $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+        return ($null -ne $p -and $p.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess')
+    } catch {
+        return $false
+    }
+}
 
 function Format-Bytes ([long]$bytes) {
     if ($bytes -ge 1GB) { return "{0:N2} GB" -f ($bytes / 1GB) }
@@ -78,12 +90,37 @@ function Set-SleepSupport ([bool]$Enable) {
 function Get-HotspotStatus {
     try {
         $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-        if ($null -eq $profile) {
+        $mgr = $null
+        if ($null -ne $profile) {
+            try {
+                $mgr = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+                $script:tetheringManager = $mgr
+            } catch {}
+        }
+        if ($null -eq $mgr -and $null -ne $script:tetheringManager) {
+            $mgr = $script:tetheringManager
+        }
+        if ($null -eq $mgr) {
+            # Try finding any existing connection profile on the system to inspect tethering state
+            $allProfiles = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles()
+            foreach ($p in $allProfiles) {
+                try {
+                    $m = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($p)
+                    if ($m.TetheringOperationalState.ToString() -ne 'Off') {
+                        $mgr = $m
+                        $script:tetheringManager = $m
+                        break
+                    }
+                } catch {}
+            }
+        }
+
+        if ($null -eq $mgr) {
             $srcDesc = if ($script:autoResumeWanted) { 'Disconnected (Auto-start on WAN UP)' } else { 'No internet connection' }
             return @{ State='Off'; Ssid=''; Pass=''; Source=$srcDesc; Clients=@(); Traffic='-' }
         }
-        $mgr  = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-        $cfg  = $mgr.GetCurrentAccessPointConfiguration()
+
+        $cfg   = $mgr.GetCurrentAccessPointConfiguration()
         $state = $mgr.TetheringOperationalState.ToString()
 
         if ($state -eq 'On') {
@@ -133,11 +170,17 @@ function Get-HotspotStatus {
             }
         } catch {}
 
+        $srcName = if ($null -ne $profile) {
+            $profile.ProfileName
+        } else {
+            'WAN Disconnected'
+        }
+
         return @{
             State   = $state
             Ssid    = $cfg.Ssid
             Pass    = $cfg.Passphrase
-            Source  = $profile.ProfileName
+            Source  = $srcName
             Clients = $list
             Traffic = $trafficStr
         }
@@ -149,18 +192,44 @@ function Get-HotspotStatus {
 function Invoke-HotspotAction ([string]$Action) {
     try {
         $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-        if ($null -eq $profile) { return "No active internet connection profile found." }
-        $mgr = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
         if ($Action -eq 'Start') {
+            if ($null -eq $profile) { return "No active internet connection profile found." }
+            $mgr = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+            $script:tetheringManager = $mgr
             $res = Await-WinRT ($mgr.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
             if ($res.Status.ToString() -ne 'Success') {
                 return "Failed to start hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
             }
-        } elseif ($Action -eq 'Stop') {
-            $res = Await-WinRT ($mgr.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
-            if ($res.Status.ToString() -ne 'Success') {
-                return "Failed to stop hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
+            if ($null -ne $profile.NetworkAdapter) {
+                $script:activeWanAdapterId = $profile.NetworkAdapter.NetworkAdapterId.ToString()
             }
+            $script:lastWanProfile = $profile.ProfileName
+        } elseif ($Action -eq 'Stop') {
+            $mgr = $script:tetheringManager
+            if ($null -eq $mgr -and $null -ne $profile) {
+                try {
+                    $mgr = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+                } catch {}
+            }
+            if ($null -eq $mgr) {
+                $allProfiles = [Windows.Networking.Connectivity.NetworkInformation]::GetConnectionProfiles()
+                foreach ($p in $allProfiles) {
+                    try {
+                        $m = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($p)
+                        if ($m.TetheringOperationalState.ToString() -ne 'Off') {
+                            $mgr = $m
+                            break
+                        }
+                    } catch {}
+                }
+            }
+            if ($null -ne $mgr) {
+                $res = Await-WinRT ($mgr.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+                if ($res.Status.ToString() -ne 'Success') {
+                    return "Failed to stop hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
+                }
+            }
+            $script:activeWanAdapterId = $null
         }
         return $null
     } catch {
@@ -490,8 +559,9 @@ function Update-Tray {
     $s     = $script:lastStatus
     $state = $s.State
     $cnt   = $s.Clients.Count
+    $isWanUp = Test-WanInternet
     
-    $trayIconState = if ($state -eq 'On') { 'On' } elseif ($script:autoResumeWanted -and $null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()) { 'Waiting' } else { 'Off' }
+    $trayIconState = if ($state -eq 'On') { 'On' } elseif ($script:autoResumeWanted -and -not $isWanUp) { 'Waiting' } else { 'Off' }
     
     $targetIcon = $script:icons[$trayIconState]
     if ($script:notifyIcon.Icon -ne $targetIcon) {
@@ -521,7 +591,8 @@ function Update-Tray {
 function Update-FormUI {
     $s = $script:lastStatus
     $state = $s.State
-    $isWaitingWan = ($state -ne 'On' -and $script:autoResumeWanted -and ($null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()))
+    $isWanUp = Test-WanInternet
+    $isWaitingWan = ($state -ne 'On' -and $script:autoResumeWanted -and -not $isWanUp)
 
     if ($state -eq 'On') {
         $lblDot.ForeColor    = $C.Green
@@ -586,20 +657,48 @@ function Update-FormUI {
 # ---------------------------------------------------------------------------
 function Do-Refresh {
     $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-    $isWanUp = ($null -ne $profile)
+    $isWanUp = ($null -ne $profile -and $profile.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess')
 
-    # If WAN is UP and auto-resume is wanted, check if hotspot needs auto-starting
-    if ($isWanUp -and $script:autoResumeWanted -and -not $script:isBusy) {
-        $curState = Get-HotspotStatus
+    $curState = Get-HotspotStatus
+    $curAdapterId = if ($null -ne $profile -and $null -ne $profile.NetworkAdapter) { $profile.NetworkAdapter.NetworkAdapterId.ToString() } else { $null }
+
+    # Case 1: WAN is down
+    if (-not $isWanUp) {
+        $script:lastWanProfile = $null
+        # If Hotspot is currently running, auto-stop it so clients disconnect and dead NAT/ICS is torn down
+        if ($curState.State -eq 'On' -and -not $script:isBusy) {
+            Do-HotspotAction 'Stop' $true  # silent auto-stop (preserves autoResumeWanted)
+            return
+        }
+    }
+    # Case 2: WAN is UP
+    elseif ($isWanUp -and $script:autoResumeWanted -and -not $script:isBusy) {
+        # If Hotspot is Off or was in transition -> Auto-start
         if ($curState.State -ne 'On' -and $curState.State -ne 'InTransition') {
-            # Auto-start hotspot on WAN UP
             $script:lastWanProfile = $profile.ProfileName
+            $script:activeWanAdapterId = $curAdapterId
             Do-HotspotAction 'Start' $true  # silent auto-start
             return
         }
+        # If Hotspot is already On, verify upstream WAN hasn't changed or reconnected
+        elseif ($curState.State -eq 'On') {
+            if ($null -eq $script:activeWanAdapterId) {
+                $script:activeWanAdapterId = $curAdapterId
+            }
+            $adapterChanged = ($null -ne $script:activeWanAdapterId -and $null -ne $curAdapterId -and $script:activeWanAdapterId -ne $curAdapterId)
+            $profileChanged = ($null -ne $script:lastWanProfile -and $script:lastWanProfile -ne $profile.ProfileName)
+            if ($adapterChanged -or $profileChanged) {
+                # Upstream WAN adapter was recreated/reconnected. Stale NAT must be restarted!
+                Do-HotspotAction 'Stop' $true
+                Start-Sleep -Milliseconds 500
+                $script:lastWanProfile = $profile.ProfileName
+                $script:activeWanAdapterId = $curAdapterId
+                Do-HotspotAction 'Start' $true
+                return
+            }
+        }
         $script:lastWanProfile = $profile.ProfileName
-    } elseif (-not $isWanUp) {
-        $script:lastWanProfile = $null
+        $script:activeWanAdapterId = $curAdapterId
     }
 
     $script:lastStatus = Get-HotspotStatus
@@ -653,10 +752,11 @@ function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
 $btnToggle.Add_Click({
     if ($script:isBusy) { return }
     $curState = (Get-HotspotStatus).State
+    $isWanUp = Test-WanInternet
     if ($curState -eq 'On') {
         $script:autoResumeWanted = $false
         Do-HotspotAction 'Stop'
-    } elseif ($script:autoResumeWanted -and ($null -eq [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile())) {
+    } elseif ($script:autoResumeWanted -and -not $isWanUp) {
         # User clicked Stop Auto-Resume while waiting for WAN
         $script:autoResumeWanted = $false
         $script:lastStatus = Get-HotspotStatus
