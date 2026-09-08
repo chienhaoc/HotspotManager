@@ -485,9 +485,9 @@ $pnlActions.Dock = [System.Windows.Forms.DockStyle]::Fill
 $pnlActions.BackColor = $C.Tr
 $pnlActions.ColumnCount = 2
 $pnlActions.RowCount = 1
-$pnlActions.ColumnStyles.Add((New-Object [System.Windows.Forms.ColumnStyle] ([System.Windows.Forms.SizeType]::Percent), 50)) | Out-Null
-$pnlActions.ColumnStyles.Add((New-Object [System.Windows.Forms.ColumnStyle] ([System.Windows.Forms.SizeType]::Percent), 50)) | Out-Null
-$pnlActions.RowStyles.Add((New-Object [System.Windows.Forms.RowStyle] ([System.Windows.Forms.SizeType]::Percent), 100)) | Out-Null
+$pnlActions.ColumnStyles.Add((New-Object $CS $ST::Percent, 50)) | Out-Null
+$pnlActions.ColumnStyles.Add((New-Object $CS $ST::Percent, 50)) | Out-Null
+$pnlActions.RowStyles.Add((New-Object $RS $ST::Percent, 100)) | Out-Null
 
 $btnRefresh           = New-Object System.Windows.Forms.Button
 $btnRefresh.Text      = 'Refresh Status'
