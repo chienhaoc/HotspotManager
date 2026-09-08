@@ -46,11 +46,28 @@ $script:autoResumeWanted   = $true   # Auto-start hotspot on WAN UP
 $script:lastWanProfile     = $null
 $script:activeWanAdapterId = $null
 $script:tetheringManager   = $null
+$script:healthCheckTick    = 0
+$script:healthFailCount    = 0
 
 function Test-WanInternet {
     try {
         $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
         return ($null -ne $p -and $p.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess')
+    } catch {
+        return $false
+    }
+}
+
+function Clear-NetworkCaches {
+    try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
+    try { netsh interface ip delete arpcache | Out-Null } catch {}
+    try { Remove-NetNeighbor -InterfaceAlias "*Wi-Fi Direct*" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+}
+
+function Test-HotspotHealth {
+    try {
+        $res = Resolve-DnsName -Name "www.msftconnecttest.com" -Server "192.168.137.1" -QuickTimeout -ErrorAction Stop
+        return ($null -ne $res)
     } catch {
         return $false
     }
@@ -462,7 +479,16 @@ $btnToggle.Dock      = [System.Windows.Forms.DockStyle]::Fill
 $btnToggle.Cursor    = [System.Windows.Forms.Cursors]::Hand
 Add-To $btnToggle 3 2 2
 
-# ── Row 4: Refresh (subtle text button) ──────────────────────────────────────
+# ── Row 4: Refresh & Repair buttons ──────────────────────────────────────
+$pnlActions = New-Object System.Windows.Forms.TableLayoutPanel
+$pnlActions.Dock = [System.Windows.Forms.DockStyle]::Fill
+$pnlActions.BackColor = $C.Tr
+$pnlActions.ColumnCount = 2
+$pnlActions.RowCount = 1
+$pnlActions.ColumnStyles.Add((New-Object [System.Windows.Forms.ColumnStyle] ([System.Windows.Forms.SizeType]::Percent), 50)) | Out-Null
+$pnlActions.ColumnStyles.Add((New-Object [System.Windows.Forms.ColumnStyle] ([System.Windows.Forms.SizeType]::Percent), 50)) | Out-Null
+$pnlActions.RowStyles.Add((New-Object [System.Windows.Forms.RowStyle] ([System.Windows.Forms.SizeType]::Percent), 100)) | Out-Null
+
 $btnRefresh           = New-Object System.Windows.Forms.Button
 $btnRefresh.Text      = 'Refresh Status'
 $btnRefresh.Font      = $fntSmall
@@ -474,7 +500,22 @@ $btnRefresh.FlatAppearance.MouseOverBackColor = $C.Card
 $btnRefresh.FlatAppearance.MouseDownBackColor = $C.Sep
 $btnRefresh.Dock      = [System.Windows.Forms.DockStyle]::Fill
 $btnRefresh.Cursor    = [System.Windows.Forms.Cursors]::Hand
-Add-To $btnRefresh 4
+
+$btnRepair           = New-Object System.Windows.Forms.Button
+$btnRepair.Text      = 'Repair Network'
+$btnRepair.Font      = $fntSmall
+$btnRepair.ForeColor = $C.Sub
+$btnRepair.BackColor = $C.BG
+$btnRepair.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$btnRepair.FlatAppearance.BorderSize         = 0
+$btnRepair.FlatAppearance.MouseOverBackColor = $C.Card
+$btnRepair.FlatAppearance.MouseDownBackColor = $C.Sep
+$btnRepair.Dock      = [System.Windows.Forms.DockStyle]::Fill
+$btnRepair.Cursor    = [System.Windows.Forms.Cursors]::Hand
+
+$pnlActions.Controls.Add($btnRefresh, 0, 0)
+$pnlActions.Controls.Add($btnRepair, 1, 0)
+Add-To $pnlActions 4
 
 # ── Row 5: Separator ─────────────────────────────────────────────────────────
 $sep2 = New-Object System.Windows.Forms.Panel
@@ -579,6 +620,10 @@ function Update-Tray {
         $script:miStop.Enabled  = ($state -eq 'On')
     }
 
+    if ($null -ne $script:miRepair) {
+        $script:miRepair.Enabled = ($state -eq 'On' -and $isWanUp)
+    }
+
     if ($null -ne $script:miSleep) {
         $isSleepSupported = Test-SleepSupport
         $script:miSleep.Checked = $isSleepSupported
@@ -593,6 +638,10 @@ function Update-FormUI {
     $state = $s.State
     $isWanUp = Test-WanInternet
     $isWaitingWan = ($state -ne 'On' -and $script:autoResumeWanted -and -not $isWanUp)
+
+    if ($null -ne $btnRepair) {
+        $btnRepair.Enabled = ($state -eq 'On' -and $isWanUp)
+    }
 
     if ($state -eq 'On') {
         $lblDot.ForeColor    = $C.Green
@@ -688,13 +737,27 @@ function Do-Refresh {
             $adapterChanged = ($null -ne $script:activeWanAdapterId -and $null -ne $curAdapterId -and $script:activeWanAdapterId -ne $curAdapterId)
             $profileChanged = ($null -ne $script:lastWanProfile -and $script:lastWanProfile -ne $profile.ProfileName)
             if ($adapterChanged -or $profileChanged) {
-                # Upstream WAN adapter was recreated/reconnected. Stale NAT must be restarted!
-                Do-HotspotAction 'Stop' $true
-                Start-Sleep -Milliseconds 500
-                $script:lastWanProfile = $profile.ProfileName
-                $script:activeWanAdapterId = $curAdapterId
-                Do-HotspotAction 'Start' $true
+                # Upstream WAN adapter was recreated/reconnected. Stale NAT must be repaired!
+                Invoke-HotspotRepair
                 return
+            }
+
+            # Periodic Health Check (every ~12 seconds)
+            $script:healthCheckTick++
+            if ($script:healthCheckTick -ge 3) {
+                $script:healthCheckTick = 0
+                $isHealthy = Test-HotspotHealth
+                if (-not $isHealthy) {
+                    $script:healthFailCount++
+                    if ($script:healthFailCount -ge 2) {
+                        # Identified broken DNS/NAT forwarding! Auto-repairing...
+                        $script:healthFailCount = 0
+                        Invoke-HotspotRepair
+                        return
+                    }
+                } else {
+                    $script:healthFailCount = 0
+                }
             }
         }
         $script:lastWanProfile = $profile.ProfileName
@@ -725,6 +788,10 @@ function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
     }
     $script:notifyIcon.Text = "Hotspot: $busy"
     [System.Windows.Forms.Application]::DoEvents()
+
+    if ($Action -eq 'Start') {
+        Clear-NetworkCaches
+    }
     
     $err = Invoke-HotspotAction $Action
     if ($null -ne $err -and -not $IsAuto) {
@@ -744,6 +811,50 @@ function Do-HotspotAction ([string]$Action, [bool]$IsAuto=$false) {
 
     $btnToggle.Enabled = $true
     $script:isBusy     = $false
+}
+
+function Invoke-HotspotRepair {
+    if ($script:isBusy) { return }
+    $script:isBusy     = $true
+    $btnToggle.Enabled = $false
+    try {
+        $busy = 'Repairing...'
+        if ($form.Visible) {
+            $lblState.Text = $busy; $lblState.ForeColor = $C.Yellow; $lblDot.ForeColor = $C.Yellow
+            $btnToggle.Text = $busy; $btnToggle.BackColor = $C.Yellow
+        }
+        $targetIcon = $script:icons['Busy']
+        if ($script:notifyIcon.Icon -ne $targetIcon) { $script:notifyIcon.Icon = $targetIcon }
+        $script:notifyIcon.Text = "Hotspot: $busy"
+        [System.Windows.Forms.Application]::DoEvents()
+
+        # Step 1: Flush ARP and DNS client caches
+        Clear-NetworkCaches
+
+        # Step 2: Stop tethering cleanly
+        Invoke-HotspotAction 'Stop' | Out-Null
+        Start-Sleep -Milliseconds 1200
+
+        # Step 3: Flush caches again after interface teardown
+        Clear-NetworkCaches
+
+        # Step 4: Re-start tethering with current active WAN profile
+        $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+        if ($null -ne $p -and $p.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess') {
+            $script:lastWanProfile = $p.ProfileName
+            if ($null -ne $p.NetworkAdapter) {
+                $script:activeWanAdapterId = $p.NetworkAdapter.NetworkAdapterId.ToString()
+            }
+            Invoke-HotspotAction 'Start' | Out-Null
+        }
+
+        $script:lastStatus = Get-HotspotStatus
+        Update-Tray
+        if ($form.Visible) { Update-FormUI }
+    } finally {
+        $btnToggle.Enabled = $true
+        $script:isBusy     = $false
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -768,6 +879,7 @@ $btnToggle.Add_Click({
     }
 })
 $btnRefresh.Add_Click({ Do-Refresh })
+$btnRepair.Add_Click({ Invoke-HotspotRepair })
 
 $form.Add_FormClosing({
     param($s,$e)
@@ -804,6 +916,7 @@ $miOpen         = $ctxMenu.Items.Add('Open Panel')
 $ctxMenu.Items.Add('-') | Out-Null
 $script:miStart = $ctxMenu.Items.Add('Start Hotspot')
 $script:miStop  = $ctxMenu.Items.Add('Stop Hotspot')
+$script:miRepair= $ctxMenu.Items.Add('Repair Network (Fix No Internet)')
 $ctxMenu.Items.Add('-') | Out-Null
 $script:miSleep = $ctxMenu.Items.Add('Allow PC Sleep')
 $script:miSleep.CheckOnClick = $false
@@ -818,6 +931,7 @@ function Show-Form {
 $miOpen.Add_Click({         Show-Form })
 $script:miStart.Add_Click({ $script:autoResumeWanted = $true;  Do-HotspotAction 'Start' })
 $script:miStop.Add_Click({  $script:autoResumeWanted = $false; Do-HotspotAction 'Stop'  })
+$script:miRepair.Add_Click({ Invoke-HotspotRepair })
 
 # Toggle Sleep Support from Tray Menu
 $script:miSleep.Add_Click({
