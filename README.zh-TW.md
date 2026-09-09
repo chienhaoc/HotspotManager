@@ -91,7 +91,7 @@ HotspotManager/
 ├── README.zh-TW.md      # 繁體中文說明文件
 ├── CONTRIBUTING.md      # 貢獻指南
 ├── CHANGELOG.md         # 版本更新日誌
-└── LICENSE              # MIT 開源授權條款
+└── LICENSE              # Apache License 2.0
 ```
 
 ---

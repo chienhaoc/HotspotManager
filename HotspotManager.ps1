@@ -5,6 +5,14 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Prevent startup and manual launches from controlling the same hotspot twice.
+$createdNew = $false
+$script:instanceMutex = [System.Threading.Mutex]::new($true, 'Local\HotspotManager', [ref]$createdNew)
+if (-not $createdNew) {
+    $script:instanceMutex.Dispose()
+    exit 0
+}
+
 # ---------------------------------------------------------------------------
 # WinRT bootstrap
 # ---------------------------------------------------------------------------
@@ -22,9 +30,13 @@ function Await-WinRT ($WinRtTask, $ResultType) {
     }
     $asTask  = $script:asTaskGeneric.MakeGenericMethod($ResultType)
     $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while (-not $netTask.IsCompleted) {
         [System.Windows.Forms.Application]::DoEvents()
         [System.Threading.Thread]::Sleep(30)
+        if ($sw.Elapsed.TotalSeconds -ge 30) {
+            throw "Windows Mobile Hotspot operation timed out after 30 seconds."
+        }
     }
     if ($netTask.IsFaulted) { throw $netTask.Exception.InnerException }
     $netTask.Result
@@ -43,11 +55,13 @@ function Await-WinRT ($WinRtTask, $ResultType) {
 $script:clientFirstSeen    = @{}
 $script:hotspotStartTime   = $null
 $script:autoResumeWanted   = $true   # Auto-start hotspot on WAN UP
-$script:lastWanProfile     = $null
-$script:activeWanAdapterId = $null
 $script:tetheringManager   = $null
-$script:healthCheckTick    = 0
-$script:healthFailCount    = 0
+$script:lastWanUp          = $false
+$script:wanUpCount         = 0
+$script:wanDownCount       = 0
+$script:isSleeping         = $false
+$script:wasRunningBeforeSleep = $false
+$script:sleepSupportEnabled = $false
 
 function Test-WanInternet {
     try {
@@ -62,15 +76,6 @@ function Clear-NetworkCaches {
     try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
     try { netsh interface ip delete arpcache | Out-Null } catch {}
     try { Remove-NetNeighbor -InterfaceAlias "*Wi-Fi Direct*" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-}
-
-function Test-HotspotHealth {
-    try {
-        $res = Resolve-DnsName -Name "www.msftconnecttest.com" -Server "192.168.137.1" -QuickTimeout -ErrorAction Stop
-        return ($null -ne $res)
-    } catch {
-        return $false
-    }
 }
 
 function Format-Bytes ([long]$bytes) {
@@ -217,10 +222,6 @@ function Invoke-HotspotAction ([string]$Action) {
             if ($res.Status.ToString() -ne 'Success') {
                 return "Failed to start hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
             }
-            if ($null -ne $profile.NetworkAdapter) {
-                $script:activeWanAdapterId = $profile.NetworkAdapter.NetworkAdapterId.ToString()
-            }
-            $script:lastWanProfile = $profile.ProfileName
         } elseif ($Action -eq 'Stop') {
             $mgr = $script:tetheringManager
             if ($null -eq $mgr -and $null -ne $profile) {
@@ -246,7 +247,6 @@ function Invoke-HotspotAction ([string]$Action) {
                     return "Failed to stop hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
                 }
             }
-            $script:activeWanAdapterId = $null
         }
         return $null
     } catch {
@@ -591,6 +591,7 @@ Load-Config
 # State
 # ---------------------------------------------------------------------------
 $script:isBusy     = $false
+$script:isExiting  = $false
 $script:lastStatus = @{ State='Off'; Ssid=''; Pass=''; Source=''; Clients=@() }
 
 # ---------------------------------------------------------------------------
@@ -600,7 +601,7 @@ function Update-Tray {
     $s     = $script:lastStatus
     $state = $s.State
     $cnt   = $s.Clients.Count
-    $isWanUp = Test-WanInternet
+    $isWanUp = $script:lastWanUp
     
     $trayIconState = if ($state -eq 'On') { 'On' } elseif ($script:autoResumeWanted -and -not $isWanUp) { 'Waiting' } else { 'Off' }
     
@@ -624,10 +625,7 @@ function Update-Tray {
         $script:miRepair.Enabled = ($state -eq 'On' -and $isWanUp)
     }
 
-    if ($null -ne $script:miSleep) {
-        $isSleepSupported = Test-SleepSupport
-        $script:miSleep.Checked = $isSleepSupported
-    }
+    if ($null -ne $script:miSleep) { $script:miSleep.Checked = $script:sleepSupportEnabled }
 }
 
 # ---------------------------------------------------------------------------
@@ -636,7 +634,7 @@ function Update-Tray {
 function Update-FormUI {
     $s = $script:lastStatus
     $state = $s.State
-    $isWanUp = Test-WanInternet
+    $isWanUp = $script:lastWanUp
     $isWaitingWan = ($state -ne 'On' -and $script:autoResumeWanted -and -not $isWanUp)
 
     if ($null -ne $btnRepair) {
@@ -669,7 +667,7 @@ function Update-FormUI {
     $lblSsidVal.Text   = if ($s.Ssid)   { $s.Ssid   } else { '-' }
     $lblPassVal.Text   = if ($s.Pass)   { $s.Pass   } else { '-' }
 
-    $isSleepOk = Test-SleepSupport
+    $isSleepOk = $script:sleepSupportEnabled
     $lblSleepVal.Text      = if ($isSleepOk) { 'Enabled (Sleep allowed)' } else { 'Disabled (Click Tray Menu to enable)' }
     $lblSleepVal.ForeColor = if ($isSleepOk) { $C.Green } else { $C.Sub }
 
@@ -705,63 +703,40 @@ function Update-FormUI {
 # Full refresh & WAN Auto-Recovery
 # ---------------------------------------------------------------------------
 function Do-Refresh {
-    $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-    $isWanUp = ($null -ne $profile -and $profile.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess')
+    if ($script:isSleeping) { return }
+
+    try {
+        $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+        $isWanUp = ($null -ne $profile -and $profile.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess')
+    } catch {
+        $profile = $null
+        $isWanUp = $false
+    }
+    $script:lastWanUp = $isWanUp
+    if ($isWanUp) { $script:wanUpCount++; $script:wanDownCount = 0 }
+    else { $script:wanDownCount++; $script:wanUpCount = 0 }
 
     $curState = Get-HotspotStatus
-    $curAdapterId = if ($null -ne $profile -and $null -ne $profile.NetworkAdapter) { $profile.NetworkAdapter.NetworkAdapterId.ToString() } else { $null }
-
     # Case 1: WAN is down
     if (-not $isWanUp) {
-        $script:lastWanProfile = $null
         # If Hotspot is currently running, auto-stop it so clients disconnect and dead NAT/ICS is torn down
-        if ($curState.State -eq 'On' -and -not $script:isBusy) {
+        if ($curState.State -eq 'On' -and $script:wanDownCount -ge 2 -and -not $script:isBusy) {
             Do-HotspotAction 'Stop' $true  # silent auto-stop (preserves autoResumeWanted)
             return
         }
     }
     # Case 2: WAN is UP
-    elseif ($isWanUp -and $script:autoResumeWanted -and -not $script:isBusy) {
+    elseif ($isWanUp -and $script:wanUpCount -ge 2 -and $script:autoResumeWanted -and -not $script:isBusy) {
         # If Hotspot is Off or was in transition -> Auto-start
         if ($curState.State -ne 'On' -and $curState.State -ne 'InTransition') {
-            $script:lastWanProfile = $profile.ProfileName
-            $script:activeWanAdapterId = $curAdapterId
             Do-HotspotAction 'Start' $true  # silent auto-start
             return
         }
         # If Hotspot is already On, verify upstream WAN hasn't changed or reconnected
         elseif ($curState.State -eq 'On') {
-            if ($null -eq $script:activeWanAdapterId) {
-                $script:activeWanAdapterId = $curAdapterId
-            }
-            $adapterChanged = ($null -ne $script:activeWanAdapterId -and $null -ne $curAdapterId -and $script:activeWanAdapterId -ne $curAdapterId)
-            $profileChanged = ($null -ne $script:lastWanProfile -and $script:lastWanProfile -ne $profile.ProfileName)
-            if ($adapterChanged -or $profileChanged) {
-                # Upstream WAN adapter was recreated/reconnected. Stale NAT must be repaired!
-                Invoke-HotspotRepair
-                return
-            }
-
-            # Periodic Health Check (every ~12 seconds)
-            $script:healthCheckTick++
-            if ($script:healthCheckTick -ge 3) {
-                $script:healthCheckTick = 0
-                $isHealthy = Test-HotspotHealth
-                if (-not $isHealthy) {
-                    $script:healthFailCount++
-                    if ($script:healthFailCount -ge 2) {
-                        # Identified broken DNS/NAT forwarding! Auto-repairing...
-                        $script:healthFailCount = 0
-                        Invoke-HotspotRepair
-                        return
-                    }
-                } else {
-                    $script:healthFailCount = 0
-                }
-            }
+            # Do not auto-repair here. A repair is disruptive and is only available
+            # through the explicit Repair Network button/menu action.
         }
-        $script:lastWanProfile = $profile.ProfileName
-        $script:activeWanAdapterId = $curAdapterId
     }
 
     $script:lastStatus = Get-HotspotStatus
@@ -841,10 +816,6 @@ function Invoke-HotspotRepair {
         # Step 4: Re-start tethering with current active WAN profile
         $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
         if ($null -ne $p -and $p.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess') {
-            $script:lastWanProfile = $p.ProfileName
-            if ($null -ne $p.NetworkAdapter) {
-                $script:activeWanAdapterId = $p.NetworkAdapter.NetworkAdapterId.ToString()
-            }
             Invoke-HotspotAction 'Start' | Out-Null
         }
 
@@ -864,6 +835,7 @@ $btnToggle.Add_Click({
     if ($script:isBusy) { return }
     $curState = (Get-HotspotStatus).State
     $isWanUp = Test-WanInternet
+    $script:lastWanUp = $isWanUp
     if ($curState -eq 'On') {
         $script:autoResumeWanted = $false
         Do-HotspotAction 'Stop'
@@ -884,12 +856,38 @@ $btnRepair.Add_Click({ Invoke-HotspotRepair })
 $form.Add_FormClosing({
     param($s,$e)
     Save-Config
+    if ($script:isExiting) { return }
     $e.Cancel=$true
     $form.Hide()
 })
 $form.Add_ResizeEnd({ Save-Config })
 $listView.Add_ColumnWidthChanged({ Save-Config })
 $form.Add_VisibleChanged({ if ($form.Visible) { Update-FormUI } })
+
+# ---------------------------------------------------------------------------
+# Sleep / resume: marshal all UI and WinRT work back to the WinForms thread.
+# ---------------------------------------------------------------------------
+$script:powerHandler = [Microsoft.Win32.PowerModeChangedEventHandler]{
+    param($sender, $e)
+    try {
+        if ($e.Mode -eq [Microsoft.Win32.PowerModes]::Suspend) {
+            $script:isSleeping = $true
+            $script:wasRunningBeforeSleep = ($script:lastStatus.State -eq 'On')
+            if ($script:wasRunningBeforeSleep -and $form.IsHandleCreated) {
+                $form.BeginInvoke([Action]{
+                    if ($script:isBusy) { return }
+                    Do-HotspotAction 'Stop' $true
+                }) | Out-Null
+            }
+        } elseif ($e.Mode -eq [Microsoft.Win32.PowerModes]::Resume) {
+            $script:isSleeping = $false
+            if ($form.IsHandleCreated) {
+                $form.BeginInvoke([Action]{ Do-Refresh }) | Out-Null
+            }
+        }
+    } catch {}
+}
+[Microsoft.Win32.SystemEvents]::add_PowerModeChanged($script:powerHandler)
 
 # ---------------------------------------------------------------------------
 # Auto-refresh timer (4s)
@@ -925,6 +923,7 @@ $miExit         = $ctxMenu.Items.Add('Exit')
 $miOpen.Font    = $fntMenuBold
 
 function Show-Form {
+    $script:sleepSupportEnabled = Test-SleepSupport
     $form.Show(); $form.WindowState=[System.Windows.Forms.FormWindowState]::Normal; $form.Activate()
 }
 
@@ -938,10 +937,15 @@ $script:miSleep.Add_Click({
     $currentlyEnabled = Test-SleepSupport
     $targetState = -not $currentlyEnabled
     Set-SleepSupport $targetState
+    $script:sleepSupportEnabled = Test-SleepSupport
     Do-Refresh
 })
 
 $miExit.Add_Click({
+    $script:isExiting = $true
+    if ($null -ne $script:powerHandler) {
+        [Microsoft.Win32.SystemEvents]::remove_PowerModeChanged($script:powerHandler)
+    }
     Save-Config
     $timer.Stop()
     $script:notifyIcon.Visible=$false; $script:notifyIcon.Dispose()
@@ -951,6 +955,11 @@ $miExit.Add_Click({
             $ic.Dispose()
         }
     }
+    if ($null -ne $script:instanceMutex) {
+        $script:instanceMutex.ReleaseMutex()
+        $script:instanceMutex.Dispose()
+    }
+    $form.Close()
     [System.Windows.Forms.Application]::Exit()
 })
 $script:notifyIcon.ContextMenuStrip = $ctxMenu

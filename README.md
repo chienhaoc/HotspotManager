@@ -92,7 +92,7 @@ HotspotManager/
 ├── README.zh-TW.md      # Traditional Chinese Documentation
 ├── CONTRIBUTING.md      # Guidelines for contributors
 ├── CHANGELOG.md         # Version release history
-└── LICENSE              # MIT License
+└── LICENSE              # Apache License 2.0
 ```
 
 ---
