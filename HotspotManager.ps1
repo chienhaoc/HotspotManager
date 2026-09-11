@@ -42,6 +42,20 @@ function Await-WinRT ($WinRtTask, $ResultType) {
     $netTask.Result
 }
 
+function Wait-TetheringState ($Manager, [string]$ExpectedState, [int]$TimeoutSeconds = 15) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            if ($Manager.TetheringOperationalState.ToString() -eq $ExpectedState) {
+                return $true
+            }
+        } catch {}
+        [System.Windows.Forms.Application]::DoEvents()
+        [System.Threading.Thread]::Sleep(250)
+    }
+    return $false
+}
+
 [Windows.Networking.Connectivity.NetworkInformation,           Windows.Networking.Connectivity,       ContentType = WindowsRuntime] | Out-Null
 [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime] | Out-Null
 [Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime] | Out-Null
@@ -222,6 +236,9 @@ function Invoke-HotspotAction ([string]$Action) {
             if ($res.Status.ToString() -ne 'Success') {
                 return "Failed to start hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
             }
+            if (-not (Wait-TetheringState $mgr 'On')) {
+                return "Hotspot start timed out while Windows remained in transition. Use Repair Network manually."
+            }
         } elseif ($Action -eq 'Stop') {
             $mgr = $script:tetheringManager
             if ($null -eq $mgr -and $null -ne $profile) {
@@ -245,6 +262,9 @@ function Invoke-HotspotAction ([string]$Action) {
                 $res = Await-WinRT ($mgr.StopTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
                 if ($res.Status.ToString() -ne 'Success') {
                     return "Failed to stop hotspot: Status = $($res.Status), Error = $($res.AdditionalErrorMessage)"
+                }
+                if (-not (Wait-TetheringState $mgr 'Off')) {
+                    return "Hotspot stop timed out while Windows remained in transition. Use Repair Network manually."
                 }
             }
         }
@@ -611,18 +631,18 @@ function Update-Tray {
     }
 
     $devStr = if ($cnt -gt 0) { " ($cnt connected)" } else { '' }
-    $statusText = if ($state -eq 'On') { "Hotspot: On$devStr" } elseif ($trayIconState -eq 'Waiting') { "Hotspot: Waiting for WAN..." } else { "Hotspot: Off" }
+    $statusText = if ($state -eq 'On') { "Hotspot: On$devStr" } elseif ($state -eq 'InTransition') { 'Hotspot: Transitioning...' } elseif ($trayIconState -eq 'Waiting') { "Hotspot: Waiting for WAN..." } else { "Hotspot: Off" }
     if ($script:notifyIcon.Text -ne $statusText) {
         $script:notifyIcon.Text = $statusText
     }
 
     if ($null -ne $script:miStart) {
-        $script:miStart.Enabled = ($state -ne 'On')
-        $script:miStop.Enabled  = ($state -eq 'On')
+        $script:miStart.Enabled = ($state -eq 'Off')
+        $script:miStop.Enabled  = ($state -eq 'On' -or $state -eq 'InTransition')
     }
 
     if ($null -ne $script:miRepair) {
-        $script:miRepair.Enabled = ($state -eq 'On' -and $isWanUp)
+        $script:miRepair.Enabled = ($state -ne 'Off' -and $isWanUp)
     }
 
     if ($null -ne $script:miSleep) { $script:miSleep.Checked = $script:sleepSupportEnabled }
@@ -638,7 +658,7 @@ function Update-FormUI {
     $isWaitingWan = ($state -ne 'On' -and $script:autoResumeWanted -and -not $isWanUp)
 
     if ($null -ne $btnRepair) {
-        $btnRepair.Enabled = ($state -eq 'On' -and $isWanUp)
+        $btnRepair.Enabled = ($state -ne 'Off' -and $isWanUp)
     }
 
     if ($state -eq 'On') {
@@ -647,6 +667,12 @@ function Update-FormUI {
         $lblState.ForeColor  = $C.Green
         $btnToggle.Text      = 'Stop Hotspot'
         $btnToggle.BackColor = $C.RedBtn
+    } elseif ($state -eq 'InTransition') {
+        $lblDot.ForeColor    = $C.Yellow
+        $lblState.Text       = 'Transitioning (use Repair if stuck)'
+        $lblState.ForeColor  = $C.Yellow
+        $btnToggle.Text      = 'Repair Network'
+        $btnToggle.BackColor = $C.Yellow
     } elseif ($isWaitingWan) {
         $lblDot.ForeColor    = $C.Yellow
         $lblState.Text       = 'Off (Waiting for WAN)'
@@ -836,7 +862,9 @@ $btnToggle.Add_Click({
     $curState = (Get-HotspotStatus).State
     $isWanUp = Test-WanInternet
     $script:lastWanUp = $isWanUp
-    if ($curState -eq 'On') {
+    if ($curState -eq 'InTransition') {
+        Invoke-HotspotRepair
+    } elseif ($curState -eq 'On') {
         $script:autoResumeWanted = $false
         Do-HotspotAction 'Stop'
     } elseif ($script:autoResumeWanted -and -not $isWanUp) {
