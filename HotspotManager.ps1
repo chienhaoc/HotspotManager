@@ -829,20 +829,58 @@ function Invoke-HotspotRepair {
         $script:notifyIcon.Text = "Hotspot: $busy"
         [System.Windows.Forms.Application]::DoEvents()
 
-        # Step 1: Flush ARP and DNS client caches
+        # Step 1: Flush ARP and DNS client caches.
         Clear-NetworkCaches
 
-        # Step 2: Stop tethering cleanly
-        Invoke-HotspotAction 'Stop' | Out-Null
-        Start-Sleep -Milliseconds 1200
+        # Step 2: Ask Windows to stop tethering. Continue even when the stale
+        # Wi-Fi Direct state prevents a clean stop.
+        $stopError = Invoke-HotspotAction 'Stop'
 
-        # Step 3: Flush caches again after interface teardown
+        # Step 3: Reset WLAN AutoConfig. This is deliberately manual-only and
+        # requires elevation because it interrupts all Wi-Fi connections.
+        $resetCommand = 'Restart-Service -Name WlanSvc -Force -ErrorAction Stop; Start-Sleep -Seconds 2'
+        try {
+            $resetProcess = Start-Process powershell.exe -ArgumentList @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-Command', $resetCommand
+            ) -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+            if ($resetProcess.ExitCode -ne 0) {
+                throw "WLAN reset process exited with code $($resetProcess.ExitCode)."
+            }
+        } catch {
+            $details = if ($null -ne $stopError) { "`nStop result: $stopError" } else { '' }
+            [System.Windows.Forms.MessageBox]::Show(
+                "Unable to reset WLAN AutoConfig. Repair was cancelled.$details`n$($_.Exception.Message)",
+                'Hotspot Manager Repair',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+            return
+        }
+
+        # Step 4: Flush caches again after Wi-Fi Direct is recreated.
         Clear-NetworkCaches
 
-        # Step 4: Re-start tethering with current active WAN profile
+        # Step 5: Re-start tethering with the current WAN profile.
         $p = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
         if ($null -ne $p -and $p.GetNetworkConnectivityLevel().ToString() -eq 'InternetAccess') {
-            Invoke-HotspotAction 'Start' | Out-Null
+            $startError = Invoke-HotspotAction 'Start'
+            if ($null -ne $startError) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    $startError,
+                    'Hotspot Manager Repair',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+            }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show(
+                'WLAN was reset, but no active internet connection is available. Reconnect iPhone USB and try again.',
+                'Hotspot Manager Repair',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
         }
 
         $script:lastStatus = Get-HotspotStatus

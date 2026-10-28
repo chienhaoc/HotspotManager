@@ -1,14 +1,8 @@
-# Uninstall.ps1 - Remove HotspotManager from Windows Startup
-$startupDir = [Environment]::GetFolderPath('Startup')
-$target     = "$startupDir\HotspotManager.vbs"
-if (Test-Path $target) {
-    Remove-Item $target -Force
-    Write-Host "Removed: $target"
-} else {
-    Write-Host "Not found in Startup folder."
+﻿# Uninstall.ps1 - Remove HotspotManager from Windows Startup and stop it
+$startup = [Environment]::GetFolderPath('Startup')
+foreach ($n in 'HotspotManager.lnk','HotspotManager.vbs') {
+    $t = Join-Path $startup $n
+    if (Test-Path $t) { Remove-Item $t -Force; Write-Host "Removed: $t" }
 }
-# Kill any running instance
-Get-Process powershell -ErrorAction SilentlyContinue |
-    Where-Object { $_.MainWindowTitle -eq '' } |
-    ForEach-Object { $_.Kill() }
+Get-Process HotspotManager -ErrorAction SilentlyContinue | Stop-Process -Force
 Write-Host "Done."

@@ -10,3 +10,6 @@ Desktop.ini
 hotspot_manager.py
 __pycache__/
 *.pyc
+
+# Build output
+*.exe

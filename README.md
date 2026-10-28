@@ -1,40 +1,39 @@
-# HotspotManager 📶
+﻿# HotspotManager ?
 
-[中文說明](README.zh-TW.md) | English
+[銝剜?隤芣?](README.zh-TW.md) | English
 
 A lightweight, native Windows system tray application for managing the built-in **Mobile Hotspot** feature.  
-Built using pure **PowerShell 5.1 + WinForms + Windows WinRT API** — **100% native, zero external dependencies**.
+Built using a single native **C# (.NET Framework) tray app + Windows WinRT API** (compiled with the `csc.exe` built into Windows, ~30 MB RAM) ??**100% native, zero external dependencies**.
 
 ---
 
-## ✨ Features
+## ??Features
 
-- 🟢 **System Tray Integration**:
-  - Live color-coded tray icon: 🟢 Green (Hotspot On), 🔴 Red (Hotspot Off), 🟡 Yellow (Busy)
+- ? **System Tray Integration**:
+  - Live color-coded tray icon: ? Green (Hotspot On), ? Red (Hotspot Off), ? Yellow (Busy)
   - Right-click context menu to Start / Stop hotspot, Open Panel, or Exit
   - Double-click tray icon to toggle control panel visibility
-- 🎛️ **Modern Control Panel**:
+- ??儭?**Modern Control Panel**:
   - Single adaptive **Toggle Button** (Start/Stop) with state feedback
   - Real-time status display: State, SSID, Password, and Internet Source profile
   - DPI-aware, responsive layout that supports window resizing
-- 📱 **Connected Devices Tracking**:
+- ? **Connected Devices Tracking**:
   - Displays connected device details: Hostname, IP Address, MAC Address
-  - ⏱️ **Connection Duration**: Tracks how long each device has been connected
-- 🔄 **WAN Auto-Recovery**:
+  - ?梧? **Connection Duration**: Tracks how long each device has been connected
+- ?? **WAN Auto-Recovery**:
   - Automatically turns hotspot back on as soon as WAN connectivity (e.g. iPhone USB tethering) is restored (WAN UP)
   - Shows clear waiting state when WAN is disconnected
-- 💤 **Integrated Sleep Support (Allow PC Sleep)**:
+- ? **Integrated Sleep Support (Allow PC Sleep)**:
   - Built-in one-click toggle in the tray context menu (`Allow PC Sleep`) to configure Windows `powercfg /requestsoverride`
   - Unblocks Windows from sleeping while Mobile Hotspot is running, allowing the PC to sleep and wake smoothly without driver hangs
-- 💾 **Persistent Settings**:
+- ? **Persistent Settings**:
   - Automatically saves and restores your preferred window dimensions and column widths
-- 🚀 **Silent Launcher**:
-  - Includes a VBScript wrapper (`HotspotManager.vbs`) to start silently without flashing console windows
+- ?? **Silent Launcher**:
   - One-click installer (`Install.ps1`) to add to Windows Startup
 
 ---
 
-## 💻 Requirements
+## ? Requirements
 
 - **OS**: Windows 10 / 11
 - **PowerShell**: PowerShell 5.1 (built-in)
@@ -42,7 +41,7 @@ Built using pure **PowerShell 5.1 + WinForms + Windows WinRT API** — **100% na
 
 ---
 
-## 🚀 Quick Start
+## ?? Quick Start
 
 ### 1. Clone the repository
 
@@ -53,7 +52,7 @@ cd E:\git\HotspotManager
 
 ### 2. Run directly
 
-Double-click **`HotspotManager.vbs`** to launch silently in the background. Look for the Wi-Fi icon in your system tray (near the clock).
+Run **`Build.bat`** once, then double-click **`HotspotManager.exe`** to launch silently in the background. Look for the Wi-Fi icon in your system tray (near the clock).
 
 ### 3. Enable Auto-Start on Login (Optional)
 
@@ -71,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1
 
 ---
 
-## 🛠️ How It Works
+## ??儭?How It Works
 
 Windows Mobile Hotspot APIs are exposed via WinRT namespaces (`Windows.Networking.NetworkOperators` & `Windows.Networking.Connectivity`).  
 `HotspotManager.ps1` dynamically loads these WinRT classes via Reflection (`[System.WindowsRuntimeSystemExtensions]::AsTask`) and renders a dark-themed WinForms UI entirely within native PowerShell.
@@ -80,23 +79,24 @@ Settings are persisted locally at `%LOCALAPPDATA%\HotspotManager\config.json`.
 
 ---
 
-## 📁 Repository Structure
+## ?? Repository Structure
 
 ```
 HotspotManager/
-├── HotspotManager.ps1   # Main PowerShell application
-├── HotspotManager.vbs   # Silent VBScript launcher (no console window)
-├── Install.ps1          # Adds HotspotManager to Windows Startup
-├── Uninstall.ps1        # Removes HotspotManager from Windows Startup
-├── README.md            # English Documentation
-├── README.zh-TW.md      # Traditional Chinese Documentation
-├── CONTRIBUTING.md      # Guidelines for contributors
-├── CHANGELOG.md         # Version release history
-└── LICENSE              # Apache License 2.0
+??? HotspotManager.ps1   # Main PowerShell application
+??? HotspotManager.vbs   # Silent VBScript launcher (no console window)
+??? Install.ps1          # Adds HotspotManager to Windows Startup
+??? Uninstall.ps1        # Removes HotspotManager from Windows Startup
+??? README.md            # English Documentation
+??? README.zh-TW.md      # Traditional Chinese Documentation
+??? CONTRIBUTING.md      # Guidelines for contributors
+??? CHANGELOG.md         # Version release history
+??? LICENSE              # Apache License 2.0
 ```
 
 ---
 
-## 📄 License
+## ?? License
 
 Distributed under the [Apache License 2.0](LICENSE).
+
